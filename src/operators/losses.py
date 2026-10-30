@@ -1,0 +1,461 @@
+import math
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+"""Custom loss functions for FNO training.
+
+SpatiallyWeightedMSE upweights the interface region so that
+the optimizer receives meaningful gradient signal for the
+temperature discontinuity caused by interfacial thermal resistance.
+
+2D geometry: the interface is a vertical slab at x = interface_x,
+invariant along y. Weights/masks are therefore constant along the y axis.
+"""
+
+class SpatiallyWeightedMSE(nn.Module):
+    """MSE loss with spatial weighting that upweights the interface region.
+
+    Weight profile: baseline 1.0 everywhere, rectangular bump of height
+    ``interface_weight`` in [interface_x - half_width, interface_x + half_width],
+    constant along y. Weights are normalized so their mean equals 1.0
+    (loss scale matches plain MSE).
+
+    When ``interface_weight=1.0``, this reduces to standard MSE.
+
+    Parameters
+    ----------
+    x_grid : np.ndarray
+        1D spatial grid along x, shape (Nx,).
+    y_grid : np.ndarray
+        1D spatial grid along y, shape (Ny,).
+    interface_x : float
+        Interface location in physical x-coordinates.
+    interface_half_width : float
+        Half-width of the boosted region in x-coordinates.
+    interface_weight : float
+        Boost factor for nodes within the interface region.
+    """
+    def __init__(
+        self,
+        x_grid: np.ndarray,
+        y_grid: np.ndarray,
+        interface_x: float = 0.5,
+        interface_half_width: float = 0.05,
+        interface_weight: float = 10.0,
+    ):
+        super().__init__()
+        Nx = len(x_grid)
+        Ny = len(y_grid)
+
+        self.interface_half_width = float(interface_half_width)
+        self.interface_weight = float(interface_weight)
+
+        raw = np.ones((Nx, Ny), dtype=np.float32)
+        x_mask = np.abs(x_grid - interface_x) <= interface_half_width
+        raw[x_mask, :] = interface_weight
+
+        # Normalize so mean(weights) == 1.0
+        raw = raw / raw.mean()
+
+        # Shape (1, Nx, Ny, 1) broadcasts against (B, Nx, Ny, 1)
+        weight_tensor = torch.from_numpy(raw).reshape(1, Nx, Ny, 1)
+        self.register_buffer("weights", weight_tensor)
+
+        # 1D x-grid kept on-device so per-sample weights can be built from a
+        # batch of interface locations (interfaces benchmark).
+        x_grid_t = torch.from_numpy(np.asarray(x_grid, dtype=np.float32))
+        self.register_buffer("x_grid_t", x_grid_t)
+
+    def forward(
+        self,
+        y_pred: torch.Tensor,
+        y_true: torch.Tensor,
+        interface_x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute weighted MSE: mean(weights * (y_pred - y_true)^2).
+
+        Parameters
+        ----------
+        y_pred, y_true : torch.Tensor
+            Shape (B, Nx, Ny, 1).
+        interface_x : torch.Tensor or None
+            Per-sample interface locations, shape (B,). When None, the fixed
+            weight band baked at construction is used. When provided, a per-sample
+            band centered on each ``interface_x`` is built and normalized to mean
+            1.0 per sample.
+        """
+        if interface_x is None:
+            return torch.mean(self.weights * (y_pred - y_true) ** 2)
+
+        band = build_interface_band(
+            self.x_grid_t, interface_x, self.interface_half_width
+        )  # (B, Nx) bool
+        raw = 1.0 + (self.interface_weight - 1.0) * band.to(y_pred.dtype)  # (B, Nx)
+        w = raw / raw.mean(dim=1, keepdim=True)  # mean-1 per sample
+        w = w.reshape(w.shape[0], w.shape[1], 1, 1)  # (B, Nx, 1, 1)
+        return torch.mean(w * (y_pred - y_true) ** 2)
+
+
+def build_interface_band(
+    x_grid_t: torch.Tensor,
+    interface_x: torch.Tensor,
+    half_width: float,
+) -> torch.Tensor:
+    """Return per-sample interface band, shape (B, Nx), bool.
+
+    True where ``|x - interface_x| <= half_width``.
+
+    Parameters
+    ----------
+    x_grid_t : torch.Tensor
+        1D spatial grid along x, shape (Nx,).
+    interface_x : torch.Tensor
+        Per-sample interface locations, shape (B,).
+    half_width : float
+        Half-width of the band in x-coordinates.
+    """
+    x = x_grid_t.reshape(1, -1)  # (1, Nx)
+    centers = interface_x.reshape(-1, 1).to(x.dtype)  # (B, 1)
+    return (torch.abs(x - centers) <= half_width)
+
+
+def get_batch_interface_x(
+    batch: dict,
+    device: torch.device,
+    *,
+    use_per_sample_interface: bool,
+) -> torch.Tensor | None:
+    """Return per-sample interface locations from a batch, or None.
+
+    Gating is intentionally by the explicit ``use_per_sample_interface`` flag AND
+    the presence of a third T_stats column (slot 2 = interface_x). ``source`` has
+    slot 2 = 0.5 always, so the flag (off for source) keeps it on the fixed path.
+    """
+    t_stats = batch.get("T_stats", None)
+    if use_per_sample_interface and t_stats is not None and t_stats.shape[1] > 2:
+        return t_stats[:, 2].to(device)
+    return None
+
+
+def build_interface_mask(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    interface_x: float = 0.5,
+    interface_half_width: float = 0.05,
+) -> torch.Tensor:
+    """Return boolean tensor of shape (Nx, Ny) for nodes within the interface region.
+
+    The interface is a vertical slab at x = interface_x, so the mask is True on
+    full columns and False elsewhere. Used for the monitoring metric
+    (interface-specific rel L2), not for the loss itself.
+    """
+    Ny = len(y_grid)
+    x_mask = np.abs(x_grid - interface_x) <= interface_half_width  # (Nx,)
+    mask_2d = np.broadcast_to(x_mask[:, None], (len(x_grid), Ny)).copy()
+    return torch.from_numpy(mask_2d)
+
+
+def build_boundary_mask(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    width: float = 0.05,
+) -> torch.Tensor:
+    """Return boolean tensor of shape (Nx, Ny) for nodes within ``width`` of any
+    domain edge.
+
+    The mask is True where x is within ``width`` of the left/right edges (a/b)
+    OR y is within ``width`` of the bottom/top edges (c/d). The bounds are read
+    from the grid extents, so the band is coordinate-based and therefore
+    resolution-agnostic. Used to isolate the FNO ``padding`` confound (the
+    absolute pad covers a shrinking fraction of the domain as resolution grows).
+    """
+    a, b = float(x_grid[0]), float(x_grid[-1])
+    c, d = float(y_grid[0]), float(y_grid[-1])
+    x_edge = (np.abs(x_grid - a) <= width) | (np.abs(x_grid - b) <= width)  # (Nx,)
+    y_edge = (np.abs(y_grid - c) <= width) | (np.abs(y_grid - d) <= width)  # (Ny,)
+    mask_2d = x_edge[:, None] | y_edge[None, :]  # (Nx, Ny)
+    return torch.from_numpy(mask_2d.copy())
+
+
+def compute_interface_rel_l2(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    iface_mask: torch.Tensor,
+) -> float:
+    """Compute relative L2 error restricted to the interface region.
+
+    Parameters
+    ----------
+    y_pred, y_true : torch.Tensor
+        Shape (B, Nx, Ny, 1).
+    iface_mask : torch.Tensor
+        Boolean mask of shape (Nx, Ny) — True for nodes in the interface region.
+
+    Returns
+    -------
+    float
+        Interface-region rel L2 in percent.
+    """
+    # Advanced indexing with a 2D mask on dims (1,2) collapses to (B, N_iface, 1)
+    pred_iface = y_pred[:, iface_mask, :]
+    true_iface = y_true[:, iface_mask, :]
+
+    rel_l2 = (
+        torch.mean((pred_iface - true_iface) ** 2)
+        / torch.mean(true_iface ** 2)
+    ) ** 0.5 * 100
+    return rel_l2.item()
+
+
+# ---------------------------------------------------------------------------
+# Unified metric suite (per-sample, normalization-invariant headline + jump +
+# Kelvin + tails). Shared by train.py (train_one_epoch / validate) and
+# eval.py (evaluate). See the metric definitions in the project plan.
+#
+# All helpers operate on z-scored (normalized) fields of shape (B, Nx, Ny, 1).
+# Kelvin quantities are obtained by a scalar multiply with ``sigma_global``
+# because temperature normalization is global (T = T_tilde * sigma + mu).
+# ---------------------------------------------------------------------------
+
+# Denominator floors for near-constant fields. With uniform 300 K initial
+# conditions some early/low-forcing targets have a near-zero per-sample std (or
+# jump), which would make a relative metric blow up; these samples are
+# uninformative for a relative metric, so the floor just keeps them finite.
+EPS_STD = 1e-6
+EPS_JUMP = 1e-6
+
+
+def interface_flanking_nodes(x_grid: np.ndarray, interface_x: float) -> tuple[int, int]:
+    """Return the node indices immediately flanking an interface location.
+
+    Torch/np port of ``visual/dataset_plots.py:_interface_flanking_nodes_from_grid``
+    so the monitored interface jump uses the same flanking convention as the
+    paper plots. Scalar (fixed-interface) form.
+    """
+    xg = np.asarray(x_grid, dtype=np.float64)
+    iface_idx = int(np.argmin(np.abs(xg - interface_x)))
+    left_node = iface_idx - 1 if xg[iface_idx] >= interface_x else iface_idx
+    right_node = left_node + 1
+    if left_node < 0 or right_node >= len(xg):
+        raise ValueError(
+            "Interface location is outside the interior of the provided x_grid."
+        )
+    return left_node, right_node
+
+
+def interface_flanking_nodes_per_sample(
+    x_grid_t: torch.Tensor,
+    interface_x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized flanking nodes for a batch of interface locations.
+
+    Parameters
+    ----------
+    x_grid_t : torch.Tensor
+        1D spatial grid along x, shape (Nx,).
+    interface_x : torch.Tensor
+        Per-sample interface locations, shape (B,).
+
+    Returns
+    -------
+    (left, right) : tuple of torch.Tensor
+        Long tensors of shape (B,) with the flanking node indices.
+    """
+    xg = x_grid_t.reshape(-1)  # (Nx,)
+    centers = interface_x.reshape(-1, 1).to(xg.dtype)  # (B, 1)
+    iface_idx = torch.argmin(torch.abs(xg.reshape(1, -1) - centers), dim=1)  # (B,)
+    x_at_idx = xg[iface_idx]  # (B,)
+    left = torch.where(x_at_idx >= interface_x.to(xg.dtype), iface_idx - 1, iface_idx)
+    right = left + 1
+    nx = xg.shape[0]
+    if torch.any(left < 0) or torch.any(right >= nx):
+        raise ValueError(
+            "Interface location is outside the interior of the provided x_grid."
+        )
+    return left.long(), right.long()
+
+
+def per_sample_sq_rms(y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+    """Per-sample RMS of (pred - true) over all non-batch dims. Shape (B,)."""
+    diff = y_pred - y_true
+    dims = tuple(range(1, diff.ndim))
+    return torch.sqrt(torch.mean(diff ** 2, dim=dims))
+
+
+def per_sample_nrmse(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    eps_std: float = EPS_STD,
+) -> torch.Tensor:
+    """Per-sample nRMSE = rms_grid(pred-true) / max(std_grid(true), eps_std).
+
+    Shape (B,). Normalization-invariant: scaling pred and true by the same
+    constant leaves the ratio unchanged (as long as the floor does not bind),
+    so the value is identical in z-scored and Kelvin space.
+    """
+    dims = tuple(range(1, y_true.ndim))
+    rms = per_sample_sq_rms(y_pred, y_true)
+    std = torch.std(y_true, dim=dims, unbiased=False)
+    return rms / std.clamp_min(eps_std)
+
+
+def _gather_x_node(field: torch.Tensor, idx) -> torch.Tensor:
+    """Select x-node ``idx`` from ``field`` (B, Nx, Ny, 1) -> (B, Ny, 1).
+
+    ``idx`` is either a Python int (fixed interface) or a Long tensor of shape
+    (B,) (per-sample interface).
+    """
+    if torch.is_tensor(idx):
+        b, _, ny, c = field.shape
+        idx_exp = idx.reshape(b, 1, 1, 1).expand(b, 1, ny, c)
+        return torch.gather(field, 1, idx_exp).squeeze(1)
+    return field[:, idx, :, :]
+
+
+def per_sample_node_jump_errors(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    left,
+    right,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Node-to-node interface jump error, per sample.
+
+    The jump is extracted from the FNO output field (``y_pred``), never
+    re-derived analytically from the truth — this matches the verified plot call
+    sites and keeps the diagnostic non-circular.
+
+    Parameters
+    ----------
+    y_pred, y_true : torch.Tensor
+        Shape (B, Nx, Ny, 1) in normalized space.
+    left, right : int or torch.Tensor
+        Flanking node indices; scalar (fixed interface) or Long (B,) per-sample.
+
+    Returns
+    -------
+    (err_rms, true_jump_rms) : tuple of torch.Tensor
+        Both shape (B,). ``err_rms`` = rms_y(jump_pred - jump_true);
+        ``true_jump_rms`` = rms_y(jump_true). Caller scales ``err_rms`` by
+        ``sigma_global`` for Kelvin, or divides by max(true_jump_rms, eps) for
+        the offset-free normalized jump error.
+    """
+    pred_jump = _gather_x_node(y_pred, right) - _gather_x_node(y_pred, left)  # (B, Ny, 1)
+    true_jump = _gather_x_node(y_true, right) - _gather_x_node(y_true, left)
+    dims = tuple(range(1, pred_jump.ndim))
+    err_rms = torch.sqrt(torch.mean((pred_jump - true_jump) ** 2, dim=dims))
+    true_jump_rms = torch.sqrt(torch.mean(true_jump ** 2, dim=dims))
+    return err_rms, true_jump_rms
+
+
+def update_peak_jump_maxima(
+    peaks: dict[int, tuple[float, float]],
+    pairs: list[tuple[int, int, int]],
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    left,
+    right,
+    scale_K: float | torch.Tensor,
+) -> None:
+    """Accumulate separate predicted/truth spatial-time maxima for s=0 per sim.
+
+    Only evaluated positive target times contribute, matching publication tables.
+    ``scale_K`` is the inverse-normalization scale (sigma + T_EPS).
+    """
+    selected = [i for i, (_, s, j) in enumerate(pairs) if s == 0 and j > 0]
+    if not selected:
+        return
+    idx = torch.tensor(selected, device=y_pred.device)
+    left = left[idx] if torch.is_tensor(left) else left
+    right = right[idx] if torch.is_tensor(right) else right
+    scale = scale_K[idx] if torch.is_tensor(scale_K) and scale_K.ndim else scale_K
+    maxima = []
+    for field in (y_pred, y_true):
+        jump = _gather_x_node(field[idx], right) - _gather_x_node(field[idx], left)
+        maxima.append(jump.abs().flatten(1).amax(dim=1) * scale)
+    values = torch.stack(maxima, dim=1).detach().cpu().tolist()
+    for i, (pred, true) in zip(selected, values):
+        sid = int(pairs[i][0])
+        old_pred, old_true = peaks.get(sid, (0.0, 0.0))
+        peaks[sid] = (max(old_pred, pred), max(old_true, true))
+
+
+def peak_jump_error_stats(peaks: dict[int, tuple[float, float]]) -> dict[str, float]:
+    """Mean/P95 absolute peak-magnitude error across simulations, in Kelvin."""
+    errors = np.asarray([abs(pred - true) for pred, true in peaks.values()])
+    return {
+        "peak_jump_error_mean_K": float(errors.mean()) if errors.size else float("nan"),
+        "peak_jump_error_p95_K": (
+            float(np.quantile(errors, 0.95, method="linear"))
+            if errors.size else float("nan")
+        ),
+    }
+
+
+def per_sample_contact_jump_rmse(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    left,
+    right,
+    weight_y: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample contact-jump RMSE (normalized), source_itr_sin only.
+
+    The contact jump weights the node jump by the per-row contact law
+    ``R_c(y) * G(y)`` (see ``visual/dataset_plots.py:_interface_contact_jump_map``):
+
+        contact_jump(y) = R_c(y) * G(y) * (field[left, y] - field[right, y]).
+
+    Returns the RMS over y of the weighted contact-jump difference per sample,
+    shape (B,), in normalized space. The caller multiplies by ``sigma_global``
+    to obtain Kelvin (the ~300 K offset cancels in the left-right difference).
+
+    Parameters
+    ----------
+    weight_y : torch.Tensor
+        Per-row weight ``R_c(y) * G(y)``; shape (Ny,) (shared) or (B, Ny).
+    """
+    pred_left = _gather_x_node(y_pred, left).squeeze(-1)    # (B, Ny)
+    pred_right = _gather_x_node(y_pred, right).squeeze(-1)
+    true_left = _gather_x_node(y_true, left).squeeze(-1)
+    true_right = _gather_x_node(y_true, right).squeeze(-1)
+    w = weight_y if weight_y.ndim == 2 else weight_y.reshape(1, -1)
+    cj_pred = w * (pred_left - pred_right)   # (B, Ny)
+    cj_true = w * (true_left - true_right)
+    diff = cj_pred - cj_true
+    return torch.sqrt(torch.mean(diff ** 2, dim=1))
+
+
+def tail_stats(values: torch.Tensor) -> dict:
+    """Return distributional stats of a 1D tensor of per-pair metric values.
+
+    Keys: mean, p25, p50, p75, iqr, p90, p95, p99, max. Existing callers
+    reading the older keys keep working unchanged.
+    """
+    v = values.detach().to(torch.float64).reshape(-1)
+    if v.numel() == 0:
+        return {
+            "mean": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "iqr": 0.0,
+            "p90": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0,
+        }
+    q = torch.quantile(
+        v,
+        torch.tensor(
+            [0.25, 0.50, 0.75, 0.90, 0.95, 0.99],
+            dtype=v.dtype,
+            device=v.device,
+        ),
+    )
+    p25, p50, p75 = float(q[0]), float(q[1]), float(q[2])
+    return {
+        "mean": float(v.mean()),
+        "p25": p25,
+        "p50": p50,
+        "p75": p75,
+        "iqr": p75 - p25,
+        "p90": float(q[3]),
+        "p95": float(q[4]),
+        "p99": float(q[5]),
+        "max": float(v.max()),
+    }

@@ -1,0 +1,23 @@
+# Forcing benchmark: separable boundary flux q_L(y, t) = a(t) * s(y), interface
+# fixed at x = 0.5. All tensor dims (in_channels, cond_static_dim,
+# temporal_token_dim, s_y_channel, use_forcing_time_aug) are resolved by the
+# benchmark's ProblemSpec, not declared here.
+
+benchmark:
+  name: forcing
+  spatial_conditioning: full
+  spatial_profile_bins: 8
+  spatial_input:
+    material_side: true
+
+model:
+  parameters:
+    forcing_spatial_mode: boundary_extender
+
+training:
+  loss:
+    interface_x: 0.5
+    interface_half_width: 0.05
+    interface_weight: 10.0
+    # Interface fixed at x = 0.5; use the static weight band/metric.
+    per_sample_interface_x: false

@@ -1,0 +1,300 @@
+config_id: 0
+
+physics_test:
+  mg:
+    solver:
+      pre_smooth: 2
+      post_smooth: 2
+      omega: 0.6666666666666666
+      coarse_max_unknowns: 64
+    max_probe_relative_error: 0.1
+    fixed_max_exact_error_ratio: 2.0
+  model_type: cvit
+  phase0:
+    grid_sizes: [20, 40, 100]
+    updates: 1000
+    learning_rate: 0.01
+    seed: 1701
+    mu_global: 295.0
+    sigma_global: 10.0
+    dt: 0.005
+    t_final: 0.3
+    later_time: 0.075
+    flux_amplitude: 150.0
+    flux_frequency: 5.0
+    ramp_seconds: 0.01
+    perturbation_rms: 0.2
+    relative_error_tolerance: 0.01
+    min_step_speedup: 2.0
+    min_final_error_ratio: 5.0
+    log_every: 25
+
+  # Solution-space Hessian of the space-time CN loss (scripts/diagnose_space_time_conditioning.py).
+  conditioning:
+    grid_sizes: [24, 32]
+    horizons: [1, 30, 60, 120]
+    # Matrix-free rerun on the dataset grid; [] skips it. Each D variant takes
+    # several minutes there, so the full set runs only on grid_sizes.
+    benchmark_grid_horizons: [60]
+    benchmark_grid_configurations: [A_none, B_spatial_mg, C_spatial_exact, D_truncated_L5,
+                                    D_sequential_mg, exact_space_time]
+    truncation_lags: [1, 5, 10, 20]
+    dt: null  # null keeps the benchmark generator's solver dt
+    modes: 4
+    # Lanczos stopping tolerances; the softest modes cluster tightly on the
+    # dataset grid, where 1e-10 costs ~3x the steps for the same 7 digits.
+    max_tolerance: 1.0e-6
+    min_tolerance: 1.0e-8
+    seed: 1701
+    validation_grid_size: 12
+    validation_horizon: 12
+
+  cvit:
+    emb_dim: 256
+    dec_emb_dim: null
+    depth_enc: 4
+    depth_dec: 2
+    num_heads: 8
+    mlp_ratio: 2.0
+    ic_patch_size: 10
+    forcing_patch_size: 8
+    forcing_grid_size: [96, 128]
+    forcing_num_tokens: 4
+    fourier_freq: 1.0
+    fourier_freq_t: null
+    activation: gelu
+    film_hidden_layers: 2
+    film_activation: silu
+    head_hidden_layers: 1
+    head_activation: gelu
+    hard_right_dirichlet: true
+  pino:
+    residual_mode: one_step
+    formulation_comparison: false
+    detach_previous_predictions: true
+    space_time_preconditioning: false
+    prefix_steps: 5
+    # space_time controls: raw | exact | spatial_exact | spatial_mg | spatial_mg_detached | mg.
+    # An online per_update space_time FNO run trains exactly one of them; its
+    # schedulers step once per optimizer update (lengths count updates).
+    controls: [raw, exact]
+    checkpoint_keep_all: true
+    fixed_updates: 1000
+    fixed_validate_every: 100
+    online_updates: 4000
+    online_validate_every: 250
+    online_sampling: precomputed
+    validation_cases: null
+    validation_seed: 1042
+    validation_rollout_steps: null
+    full_validate_every: 1000
+    validation_batch_size: 1
+    compact_metrics: false
+    startup_profile_updates: [50, 100]
+    allocation_seconds: 21600
+    seed: 42
+    batch_size: 1
+    query_chunk_size: 2048
+    # Query times per FNO forward when an online space_time run recomputes the
+    # trajectory for its gradient; activation memory grows linearly with it.
+    time_chunk_size: 4
+    ic_weight: 1.0
+    forcing_a_ref: 300.0
+    log_every: 25
+    causal_warmup_updates: 0
+    # Physics warm-up for online per_update runs (the archived trainer's
+    # warmup.steps/resample_every, e.g. 500/50): during the first
+    # physics_warmup_updates updates each drawn problem batch is reused for
+    # physics_warmup_resample_every consecutive updates; afterwards every update
+    # draws fresh problems. 0 disables it.
+    physics_warmup_updates: 0
+    physics_warmup_resample_every: 1
+    evaluation_times: [0.0, 0.005, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3]
+    gate_error_ratio: 1.5
+    gate_compare_first_step_baselines: true
+    fixed_max_sigma_error_percent: 5.0
+    fixed_max_first_step_sigma_error_percent: 5.0
+
+experiment:
+  name: experiment0
+
+benchmark:
+  name: forcing_homogeneous
+  representation: temporal_encoder
+  spatial_input:
+    # Optional fields appended after each benchmark's base spatial channels.
+    # itr and lead_time are forcing-only cond_static duplication ablations.
+    # material_side is available to every benchmark and is regenerated from
+    # the physical grid and that simulation's interface_x at each resolution.
+    itr: false
+    lead_time: false
+    material_side: false
+
+model:
+  type: "2D FNO time-conditioned (temporal branch)"
+  parameters:
+    # Tensor dims (in_channels, cond_static_dim, temporal_token_dim,
+    # s_y_channel, use_forcing_time_aug) are resolved by the benchmark's
+    # ProblemSpec, not set here.
+    modes1: 16
+    modes2: 16
+    width: 64
+    out_channels: 1
+    n_layers: 4
+    cond_hidden: 256
+    temporal_samples: 64
+    temporal_hidden: 128
+    forcing_embed_dim: 64
+    forcing_spatial_dim: 16       # K: forcing channels; broadcast fields or learned pseudo-extensions
+    forcing_cond_mode: both       # Q1 forcing-routing ablation: both | spatial_only | cond_only (temporal_encoder repr only)
+    forcing_spatial_mode: broadcast  # broadcast | boundary_extender | physics_extender (forcing temporal_encoder only)
+    forcing_extender_grid_size: 16   # coarse domain-query grid; clamped to the input resolution
+    forcing_extender_heads: 4        # attention heads; must divide forcing_embed_dim
+    forcing_extender_depth: 1        # successive cross-attention blocks; allowed values: 1, 2, 3
+    forcing_extender_condition_on_rc: false  # append normalized scalar R_c to eligible extender domain queries
+    forcing_extender_physics_hidden: 16  # hidden width for each physics-extender per-head coefficient MLP
+    forcing_extender_interface_x_norm: 0.5  # fixed normalized interface used to derive I_cross
+    activation: "GELU"            # doc-only; FNO2d hardcodes GELU
+    dropout: 0.0
+    padding_reference_resolution: 100  # scale FNO pad cells with grid resolution; set = training grid (null = fixed pad=8)
+    padding_mode: replicate       # boundary extension for the FNO domain pad: zeros|replicate|reflect
+    cin_exclude_padding: true     # compute CIN instance stats over the unpadded region only
+    local_branch_kernel_size: 0   # FNO-LC: odd k adds a gated depthwise-separable kxk conv to every Fourier block (0 = plain FNO; pads like padding_mode)
+    local_branch_gate_init: 0.1   # FNO-LC: initial learned gate of each block's local branch
+    hard_right_dirichlet: false   # overwrite right wall face with the fixed BC temperature (exact BC)
+    hard_right_dirichlet_t_right: 300.0  # right-wall Dirichlet value in Kelvin (normalized at build time)
+
+training:
+  device: "auto"
+  batch_size: 512
+  n_snapshots: 20
+  n_snapshots_test: 40
+  curriculum_warmup: 25
+  epochs: 41
+  learning_rate: 0.0028
+  weight_decay: 3.0e-5
+  noise_std: 0.0
+  grad_clip: 1.0
+  scheduler:
+    type: "RIGNOThreePhase"
+    warmup_fraction: 0.05
+    cosine_fraction: 0.85
+    exp_fraction: 0.10
+    init_lr_ratio: 0.05
+    cosine_floor_lr_ratio: 0.05
+    final_lr_ratio: 0.005
+    # training.learning_rate remains the source of truth for the peak LR.
+    # Ratio fields keep the schedule proportional when the peak LR is overridden.
+    # StepLR params (used when type=StepLR):
+    step_size: 50
+    gamma: 0.5
+  optimizer: "AdamW"
+  ss_esoap:
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    check_interval: 1
+    trigger_threshold: 0.2
+    warmup_steps: 0
+    tau_min: 0.001
+    max_precond_dim: 2048
+  # SOAP optimizer knobs (Vyas et al. 2024; used only when optimizer: "SOAP").
+  # lr / weight_decay come from training.learning_rate / training.weight_decay.
+  # Spectral weights are 5-D real tensors; per-dimension preconditioners handle
+  # them (all dims << max_precond_dim). precondition_1d: false -> 1-D biases use
+  # the Adam-style fallback.
+  soap:
+    betas: [0.95, 0.95]
+    shampoo_beta: 0.95
+    eps: 1.0e-8
+    precondition_frequency: 10
+    max_precond_dim: 10000
+    merge_dims: false
+    precondition_1d: false
+  # training.loss.{interface_x, interface_half_width, interface_weight,
+  # per_sample_interface_x} are owned by the active `benchmark` config group
+  # (per-benchmark loss region). per_sample_interface_x defaults to false in code
+  # (loss_cfg.get(...)) and is set true only for the interfaces benchmark.
+  validate_every: 5
+  # Cap on the number of per-pair diagnostic rows written to val_pairs.csv per
+  # validation pass. A fixed, seeded subset of pairs is written (same subset
+  # every pass, so per-pair error stays trackable across epochs). Does NOT affect
+  # reported val_* metrics or checkpoint selection — only the diagnostic CSV.
+  # null (or a value >= total pairs) writes every pair (legacy behavior).
+  val_pairs_max_rows: 5000
+  patience: 20
+  # Validation metric used to select best_val / early-stopping. Allowed values:
+  #   val_rel_l2    (default) normalized-space relative L2 — unchanged baseline
+  #   val_nrmse     per-sample nRMSE headline (normalization-invariant)
+  #   val_jump_nrmse normalized node-jump error (interface fidelity)
+  #   val_rmse_K_lead_gt_tc  post-cutoff (tau > lead_cutoff_time) RMSE in Kelvin;
+  #                          the long-lead adaptation objective. Requires
+  #                          training.lead_cutoff_time to be set. Honors
+  #                          checkpoint_forgetting_ratio (no-forgetting guard).
+  # All are minimized; unknown values fall back to val_rel_l2.
+  checkpoint_metric: "val_rel_l2"
+  # Physical lead threshold tc (seconds) splitting val pairs into tau <= tc /
+  # tau > tc for the pre/post-cutoff diagnostics and the val_rmse_K_lead_gt_tc
+  # checkpoint metric. null disables the split (all pre/post columns stay blank).
+  lead_cutoff_time: null
+  # No-forgetting guard for checkpoint_metric=val_rmse_K_lead_gt_tc: only accept
+  # an epoch whose pre-cutoff RMSE_K (tau <= tc) <= ratio * pre_cutoff_ref, where
+  # pre_cutoff_ref is model A's pre-cutoff RMSE_K captured by the step-0 (pre-
+  # finetune) validation pass. null disables the guard.
+  checkpoint_forgetting_ratio: null
+  # Weights-only warm-start. null = fresh init (or auto-resume of full state from
+  # fno2d_latest.pt in the run dir, which is untouched). When set (and NOT auto-
+  # resuming) load only model_state from this checkpoint; optimizer/scheduler/
+  # epoch/best_val start fresh (peak LR = training.learning_rate). The
+  # checkpoint's (mu_global, sigma_global) must equal the recomputed stats.
+  init_from_checkpoint: null
+  # Keep selective adaptation deliberately narrow: full updates every weight;
+  # boundary_extender freezes the backbone and updates only that existing module.
+  trainable_scope: "full"
+  seeds: [32]
+  # DataLoader workers per rank. `null` derives from SLURM_CPUS_PER_TASK /
+  # world_size at runtime; set an int to override.
+  num_workers: null
+  run:
+    run_dir: null
+    # Keep local/debug launches verbose by default. MSI opts into the compact
+    # loss/validation-only stream in slurm/train_cvit_pino_msi.sbatch.
+    compact_stdout: false
+
+data:
+  t_final: 0.3
+  dt: 0.005
+  save_stride: 2
+  saved_snapshots: null
+  ramp_seconds: null
+  t_grid_path: null
+  x_grid_path: null
+  y_grid_path: null
+  trajectories.npy: null
+  sim_params_path: null
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  # x_shape / cond_static_shape / forcing_seq_shape / t_stats_shape are owned by
+  # the active `benchmark` config group.
+  y_shape: "B, Nx, Ny, 1"
+  num_sims: 8000
+  # TRAIN-split lead/target truncation (long-lead OOD adaptation). Both null =
+  # legacy full-pair train set (byte-identical). Applied ONLY to the train
+  # dataset; val/test always span every lead so evaluation covers (0, t_final].
+  #   train_max_lead_time:   drop train pairs with lead tau = t_j - t_s > this
+  #                          (headline knob; e.g. 0.2 with t_final = 0.3).
+  #   train_max_target_time: drop train pairs with absolute target t_j > this.
+  # A +eps = 0.5*dt tolerance keeps a pair landing exactly on the cutoff.
+  train_max_target_time: null
+  train_max_lead_time: null
+  # Optional windowed normalization horizon for a future absolute-time variant
+  # (compute_global_stats restricts to snapshots with t <= norm_max_time). null
+  # = full-trajectory stats (used by every long-lead run; no leakage under
+  # lead-holdout since stats never expose the T(t_s) -> T(t_j) mapping).
+  norm_max_time: null
+
+evaluation:
+  rollout:
+    enabled: false
+    num_substeps: 1
+    partition: homogeneous

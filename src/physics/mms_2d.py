@@ -1,0 +1,1152 @@
+"""
+Method of Manufactured Solutions (MMS) for the 2D FV Solver.
+
+Three test cases:
+1. y-independent MMS — same as 1D, validates 2D infrastructure
+2. Full 2D MMS — y-dependent correction validates y-Laplacian terms
+3. Interface MMS — piecewise 2D with R_c at x=0.5
+"""
+
+import numpy as np
+from src.physics.fv_solver_2d import FVSolver2D, Layer2D
+from src.physics.fv_residual import _quadratic_trace_weights
+
+
+def run_interface_trace_reconstruction_mms(N: int) -> tuple[float, float]:
+    """Quadratic one-sided interface trace derivative on a smooth cubic field."""
+    if N % 2 != 0 or N < 8:
+        raise ValueError("interface trace MMS requires an even N >= 8")
+    x = np.linspace(0.0, 1.0, N)
+    h = float(x[1] - x[0])
+    face = N // 2 - 1
+    interface_x = 0.5 * (x[face] + x[face + 1])
+    errors = []
+    for nodes in (x[face - 2:face + 1], x[face + 1:face + 4]):
+        _, derivative_weights = _quadratic_trace_weights(nodes, interface_x)
+        reconstructed = float(derivative_weights @ (nodes ** 3))
+        errors.append(abs(reconstructed - 3.0 * interface_x ** 2))
+    return h, max(errors)
+
+# ==============================================================
+# 1. y-independent MMS (identical physics to mms_1d.run_mms_once)
+# ==============================================================
+
+def run_mms_y_independent(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    y-independent manufactured solution on 2D grid.
+
+    T*(x,y,t) = 300 + A sin(wt) (b-x)^4   (no y dependence)
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    flux_A = 50.0
+
+    A = flux_A / (4.0 * k * (b - a) ** 3)
+
+    def T_star(X, Y, t):
+        return 300.0 + A * np.sin(omega * t + phase) * (b - X) ** 4
+
+    def q_star(t):
+        return 4.0 * k * A * (b - a) ** 3 * np.sin(omega * t + phase)
+
+    def s_star(X, Y, t):
+        return (rho * cp * A * omega * np.cos(omega * t + phase) * (b - X) ** 4
+                - k * 12.0 * A * np.sin(omega * t + phase) * (b - X) ** 2)
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=flux_A,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
+# 2. Full 2D MMS (y-dependent single layer)
+# ==============================================================
+
+def run_mms_2d(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Full 2D manufactured solution with y-dependent correction.
+
+    T*(x,y,t) = 300 + A sin(wt)(b-x)^4 + B sin(wt)(x-a)^2(b-x)^2 cos(pi*y/(d-c))
+
+    Boundary conditions:
+      Left flux:  q = -k dT*/dx|_{x=a} = 4kA(b-a)^3 sin(wt)  (correction vanishes at x=a)
+      Right:      T*(b,y,t) = 300                               (correction vanishes at x=b)
+      Top/bottom: dT*/dy = 0 at y=c,d                           (cos -> sin derivative = 0)
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    flux_A = 50.0
+    A = flux_A / (4.0 * k * L ** 3)
+    B = 20.0  # amplitude of y-dependent correction
+
+    kappa = np.pi / (d - c)  # wave number for y-mode
+
+    def T_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        T_1d = 300.0 + A * g * (b - X) ** 4
+        phi = (X - a) ** 2 * (b - X) ** 2
+        T_corr = B * g * phi * np.cos(kappa * (Y - c))
+        return T_1d + T_corr
+
+    def q_star(t):
+        # Left flux: correction phi(a) = 0, so same as 1D
+        return 4.0 * k * A * L ** 3 * np.sin(omega * t + phase)
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        gp = omega * np.cos(omega * t + phase)
+
+        # 1D part: dT/dt - k d²T/dx²
+        s_1d = (rho * cp * A * gp * (b - X) ** 4
+                - k * 12.0 * A * g * (b - X) ** 2)
+
+        # Correction phi = (x-a)^2 (b-x)^2
+        phi = (X - a) ** 2 * (b - X) ** 2
+        # phi'' = d²phi/dx² = 2(b-x)^2 + 2(x-a)^2 - 8(x-a)(b-x)
+        phi_xx = 2.0 * (b - X) ** 2 + 2.0 * (X - a) ** 2 - 8.0 * (X - a) * (b - X)
+        cos_y = np.cos(kappa * (Y - c))
+
+        # dT_corr/dt = B omega cos(wt) phi cos(ky)
+        s_corr_t = rho * cp * B * gp * phi * cos_y
+
+        # k d²T_corr/dx² = k B sin(wt) phi'' cos(ky)
+        s_corr_xx = k * B * g * phi_xx * cos_y
+
+        # k d²T_corr/dy² = -k B sin(wt) phi kappa² cos(ky)
+        s_corr_yy = -k * B * g * phi * kappa ** 2 * cos_y
+
+        return s_1d + s_corr_t - s_corr_xx - s_corr_yy
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=flux_A,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
+# 2b. y-dependent left-flux MMS (verifies vector q_left path)
+# ==============================================================
+
+def run_mms_2d_yflux(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Manufactured solution with separable y-dependent left Neumann flux.
+
+    T*(x, y, t) = 300 + A sin(wt) (b-x)^4 cos(pi (y-c)/(d-c))
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k dT*/dx|_{x=a}
+                          = 4 k A sin(wt) (b-a)^3 cos(pi (y-c)/(d-c))
+                          = a*(t) * s*(y)   (separable)
+      Right:      T*(b,y,t) = 300            (factor (b-x)^4 vanishes)
+      Top/bottom: dT*/dy = 0 at y=c, y=d     (sin(0) = sin(pi) = 0)
+
+    This case exists specifically to verify the vector-valued q_left path —
+    the only existing MMS cases use scalar q*(t).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    A = 10.0
+    kappa = np.pi / Ly
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def T_star(X, Y, t):
+        return 300.0 + A * np.sin(omega * t + phase) * (b - X) ** 4 * cos_y(Y)
+
+    def q_star(t):
+        # Vector-valued: shape (Ny,)
+        return 4.0 * k * A * L ** 3 * np.sin(omega * t + phase) * cos_y(np.linspace(c, d, N))
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        gp = omega * np.cos(omega * t + phase)
+        cy = cos_y(Y)
+        # dT/dt
+        s_t = rho * cp * A * gp * (b - X) ** 4 * cy
+        # k d²T/dx²
+        s_xx = k * 12.0 * A * g * (b - X) ** 2 * cy
+        # k d²T/dy² = -k A g (b-x)^4 kappa^2 cos_y
+        s_yy = -k * A * g * (b - X) ** 4 * kappa ** 2 * cy
+        return s_t - s_xx - s_yy
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
+# 2d. x-linear MMS (isolates the y-Laplacian truncation)
+# ==============================================================
+
+def run_mms_x_linear(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    y-direction-isolating manufactured solution: linear in x, curved in y.
+
+    T*(x, y, t) = 300 + A sin(wt) (b-x) cos(pi (y-c)/(d-c))
+
+    The (b-x) factor is linear in x, so d²T*/dx² = 0 exactly and the FV
+    x-stencil is reproduced with no truncation error. The only spatial
+    truncation comes from the y-Laplacian acting on cos(pi (y-c)/(d-c)), so the
+    observed spatial order measures the y-direction stencil. This is the mirror
+    image of run_mms_y_independent (curved in x, flat in y), which isolates x.
+
+    Scope: because the solver enforces an isotropic grid (hx == hy) and N drives
+    both, this isolates the y diffusion stencil on a uniform grid. It catches a
+    y-Laplacian curvature bug that would otherwise be masked by the correct
+    x-error; it cannot catch a bug that only manifests at hy != hx.
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k dT*/dx|_{x=a} = k A sin(wt) cos(pi (y-c)/(d-c))
+                            (separable a(t) s(y); no (b-a)^3 factor since x is linear)
+      Right:      T*(b,y,t) = 300            (factor (b-x) vanishes)
+      Top/bottom: dT*/dy = 0 at y=c, y=d     (sin(0) = sin(pi) = 0)
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.0
+    A = 10.0
+    kappa = np.pi / Ly
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def T_star(X, Y, t):
+        return 300.0 + A * np.sin(omega * t + phase) * (b - X) * cos_y(Y)
+
+    def q_star(t):
+        # Vector-valued: shape (Ny,). -k dT*/dx|_{x=a} with d/dx[(b-x)] = -1.
+        return k * A * np.sin(omega * t + phase) * cos_y(np.linspace(c, d, N))
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t + phase)
+        gp = omega * np.cos(omega * t + phase)
+        P = (b - X)
+        cy = cos_y(Y)
+        # dT/dt
+        s_t = rho * cp * A * gp * P * cy
+        # k d²T/dx² = 0 (linear in x)
+        # k d²T/dy² = -k A g (b-x) kappa^2 cos_y
+        s_yy = -k * A * g * P * kappa ** 2 * cy
+        return s_t - s_yy
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_star,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ==============================================================
+# 2c. smooth-in-time left-flux MMS with exact step-integral forcing
+# ==============================================================
+
+def run_mms_2d_smooth_forcing_integral(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Manufactured solution for the exact-integral left-forcing path.
+
+    T*(x, y, t) = 300 + A sin(omega t + phase) (b-x)^4 cos(pi (y-c)/(d-c))
+
+    The matching source is f = rho*cp*T_t - div(k grad T). The left flux uses
+    the solver's positive-inward convention:
+
+      q_L(y,t) = -k dT*/dx|_{x=a}
+               = 4 k A sin(omega t + phase) (b-a)^3 cos(pi (y-c)/(d-c)).
+
+    This case is intentionally smooth in time. Production exp/exp_train
+    activation and pulse_train discontinuities belong in refined-reference
+    tests, not strict second-order MMS.
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.37
+    A = 10.0
+    kappa = np.pi / Ly
+    y_vec = np.linspace(c, d, N)
+    cos_y_left = np.cos(kappa * (y_vec - c))
+
+    def cos_y(Y):
+        return np.cos(kappa * (Y - c))
+
+    def g(t):
+        return np.sin(omega * t + phase)
+
+    def g_t(t):
+        return omega * np.cos(omega * t + phase)
+
+    def T_star(X, Y, t):
+        return 300.0 + A * g(t) * (b - X) ** 4 * cos_y(Y)
+
+    def q_left(t):
+        return 4.0 * k * A * L ** 3 * g(t) * cos_y_left
+
+    def q_left_integral(t_lo, t_hi):
+        g_int = (np.cos(omega * t_lo + phase) - np.cos(omega * t_hi + phase)) / omega
+        return 4.0 * k * A * L ** 3 * g_int * cos_y_left
+
+    def source(X, Y, t):
+        P = (b - X) ** 4
+        cy = cos_y(Y)
+        T_t = A * g_t(t) * P * cy
+        T_xx = 12.0 * A * g(t) * (b - X) ** 2 * cy
+        T_yy = -A * g(t) * P * kappa ** 2 * cy
+        return rho * cp * T_t - k * (T_xx + T_yy)
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=source,
+        q_left_fn=q_left,
+        q_left_integral_fn=q_left_integral,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+def smooth_forcing_left_flux_sign_sample() -> tuple[float, float, float]:
+    """Return (q_L, -k*T_x, +k*T_x) for the smooth forcing MMS at x=a."""
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    k = 1.0
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    phase = 0.37
+    A = 10.0
+    t = 0.043
+    y = 0.25
+    kappa = np.pi / (d - c)
+    g = np.sin(omega * t + phase)
+    cos_y = np.cos(kappa * (y - c))
+    T_x_left = -4.0 * A * g * (b - a) ** 3 * cos_y
+    q_left = 4.0 * k * A * (b - a) ** 3 * g * cos_y
+    return float(q_left), float(-k * T_x_left), float(k * T_x_left)
+
+
+# ==============================================================
+# 3. Interface MMS (piecewise 2D with R_c)
+# ==============================================================
+
+def run_mms_2d_interface(N: int, dt=None, x_I: float = 0.5) -> tuple[float, float, float, float]:
+    """
+    2D MMS with two-layer interface, thermal resistance, and y-dependent
+    left flux — exercises the production physics path end-to-end.
+
+    Manufactured solution carries a single shared y-mode cos(kappa*(y-c)):
+      T_L*(x,y,t) = 300 + cos(kappa*(y-c)) * V_L(x,t)
+      T_R*(x,y,t) = 300 + cos(kappa*(y-c)) * V_R(x,t)
+    with
+      V_L(x,t) = A_L g[(x_I-x)^4 + D_L(x_I-x)] + C_L g + B_L g (x-a)^2(x_I-x)^2
+      V_R(x,t) = A_R g (b-x)^4                        + B_R g (x-x_I)^2(b-x)^2
+      g = sin(omega t),  kappa = pi / (d - c)
+
+    The shared cos(kappa*(y-c)) factors out of every interface condition, so the
+    A_R / C_L relations (flux continuity, jump T_L - T_R = R_c q_I) are
+    unchanged from the y-independent case.
+
+    Boundary conditions:
+      Left:       q*(y,t) = -k1 dT_L*/dx|_{x=a}
+                          = k1 A_L cos(kappa*(y-c)) g [4(x_I-a)^3 + D_L]
+                            (B_L correction has phi_L'(a)=0, contributes nothing)
+      Right:      T_R*(b,y,t) = 300                (V_R(b,t) = 0)
+      Top/bottom: dT*/dy = 0 at y=c,d              (cos -> sin derivative = 0)
+
+    The default x_I = 0.5 places the interface at a cell-face midpoint
+    (requires even N). Any other x_I is an off-center interface; choose N so x_I doesn't land on a node.
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    k1, k2 = 2.0, 1.0
+    rho1, cp1 = 1.5, 1.0
+    rho2, cp2 = 0.8, 1.0
+    Rc = 0.1
+
+    flux_f = 2.0
+    omega = 2.0 * np.pi * flux_f
+    A_L, D_L = 10.0, 1.0
+    # Flux continuity at x_I:  k1 A_L D_L = 4 k2 A_R (b - x_I)^3
+    A_R = k1 * A_L * D_L / (4.0 * k2 * (b - x_I) ** 3)
+    # Jump condition T_L - T_R = R_c * q_I at x_I
+    C_L = k1 * A_L * D_L * ((b - x_I) / (4.0 * k2) + Rc)
+
+    B_L = 15.0   # y-correction amplitude, left
+    B_R = 10.0   # y-correction amplitude, right
+    kappa = np.pi / (d - c)
+
+    def cos_y_arr(Y):
+        return np.cos(kappa * (Y - c))
+
+    # --- manufactured solution ---
+    def T_star(X, Y, t):
+        T = np.full_like(X, 300.0)
+        g = np.sin(omega * t)
+        cy = cos_y_arr(Y)
+        left = X < x_I
+        xl = X[left]
+        xr = X[~left]
+
+        V_L = (A_L * g * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+               + C_L * g
+               + B_L * g * (xl - a) ** 2 * (x_I - xl) ** 2)
+        V_R = (A_R * g * (b - xr) ** 4
+               + B_R * g * (xr - x_I) ** 2 * (b - xr) ** 2)
+
+        T[left] += cy[left] * V_L
+        T[~left] += cy[~left] * V_R
+        return T
+
+    # --- left boundary flux: q = -k1 dT_L*/dx|_{x=a}, vector-valued (Ny,) ---
+    y_vec = np.linspace(c, d, N)
+    cos_y_left = np.cos(kappa * (y_vec - c))
+
+    def q_left(t):
+        return k1 * A_L * np.sin(omega * t) * (4.0 * (x_I - a) ** 3 + D_L) * cos_y_left
+
+    # --- source: ρcp ∂V/∂t - k ∂²V/∂x² + k κ² V, all multiplied by cos(κ(y-c)) ---
+    def source(X, Y, t):
+        s = np.empty_like(X)
+        g = np.sin(omega * t)
+        gp = omega * np.cos(omega * t)
+        cy = cos_y_arr(Y)
+        left = X < x_I
+        xl = X[left]
+        xr = X[~left]
+
+        # Left side: V_L and its t-derivative and xx-derivative
+        phi_L = (xl - a) ** 2 * (x_I - xl) ** 2
+        phi_L_xx = (2.0 * (x_I - xl) ** 2 + 2.0 * (xl - a) ** 2
+                    - 8.0 * (xl - a) * (x_I - xl))
+        V_L = (A_L * g * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+               + C_L * g
+               + B_L * g * phi_L)
+        Vt_L = (A_L * gp * ((x_I - xl) ** 4 + D_L * (x_I - xl))
+                + C_L * gp
+                + B_L * gp * phi_L)
+        Vxx_L = A_L * g * 12.0 * (x_I - xl) ** 2 + B_L * g * phi_L_xx
+
+        s[left] = cy[left] * (rho1 * cp1 * Vt_L - k1 * Vxx_L + k1 * kappa ** 2 * V_L)
+
+        # Right side
+        phi_R = (xr - x_I) ** 2 * (b - xr) ** 2
+        phi_R_xx = (2.0 * (b - xr) ** 2 + 2.0 * (xr - x_I) ** 2
+                    - 8.0 * (xr - x_I) * (b - xr))
+        V_R = A_R * g * (b - xr) ** 4 + B_R * g * phi_R
+        Vt_R = A_R * gp * (b - xr) ** 4 + B_R * gp * phi_R
+        Vxx_R = A_R * g * 12.0 * (b - xr) ** 2 + B_R * g * phi_R_xx
+
+        s[~left] = cy[~left] * (rho2 * cp2 * Vt_R - k2 * Vxx_R + k2 * kappa ** 2 * V_R)
+        return s
+
+    # --- solver ---
+    layers = [
+        Layer2D(x_left=a, x_right=x_I, rho=rho1, cp=cp1, k=k1),
+        Layer2D(x_left=x_I, x_right=b, rho=rho2, cp=cp2, k=k2),
+    ]
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=layers,
+        interface_R=[Rc],
+        t_final=0.37,
+        flux_f=flux_f, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=source,
+        q_left_fn=q_left,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+# ======================================================
+# 4. Patch source MMS (internal source with R_c)
+# ======================================================
+
+def run_mms_2d_patch_source(N: int, dt=None) -> tuple[float, float, float, float]:
+    """
+    Smooth-source MMS for the internal-source pathway.
+
+    Manufactured solution:
+      T*(x,y,t) = 300 + g(t) * Ex(x) * Ey(y) * phi(x) * psi(y)
+      g(t)  = sin(omega * t),  omega = 6*pi
+      phi(x) = (x-a)^2 (b-x)^2
+      psi(y) = cos(pi*(y-c)/(d-c))
+
+    Wall conditions:
+      - phi(a) = phi'(a) = 0 keeps the left flux exactly zero. phi(b) = 0 keeps
+        the right wall at T = 300; phi'(b) = 0 aids smoothness but is not needed
+        for that Dirichlet condition. Matches the zero-Neumann / 300-Dirichlet
+        walls of the internal-source experiment.
+      - The y-envelope Ey = Gy * W and psi enforce the top/bottom zero-Neumann
+        condition *exactly* (see below).
+
+    To localize the source like the real patch experiment, the field is
+    modulated by a separable envelope env(x,y) = Ex(x) * Ey(y) centered at
+    (x_h, y_h). Ex is a plain Gaussian; Ey = Gy * W multiplies a Gaussian Gy by
+    a smooth boundary cutoff W(r), r = (y-c)/(d-c), with double zeros at both
+    walls:
+      W(c) = W(d) = 0  and  W_y(c) = W_y(d) = 0.
+    Hence Ey(c) = Ey(d) = 0 and Ey_y(c) = Ey_y(d) = 0. Together with
+    psi_y(c) = psi_y(d) = 0 this gives F_y(x,c) = F_y(x,d) = 0 exactly, so T*
+    satisfies the imposed top/bottom Neumann BC analytically — not merely to
+    Gaussian-tail tolerance as the earlier isotropic envelope did.
+
+    sigma_y still localizes the source but is no longer load-bearing for BC
+    correctness. W is normalized so W(y_h) = 1 for the current centered hotspot;
+    with y_h = 0.5 the cutoff is symmetric (W_y(0.5) = 0) so the Ey peak stays at
+    y = 0.5. For y_h != 0.5, W_y(y_h) != 0 could shift the effective Ey peak
+    slightly off y_h.
+
+    The required source is globally smooth (NOT a rectangular indicator):
+      s*(X, Y, t) = rho*cp * dT/dt - k * d^2T/dx^2 - k * d^2T/dy^2
+    computed directly from derivatives of the full analytic field
+      T*(X, Y, t) = 300 + g(t) * F(X, Y),  F = Ex * Ey * phi * psi.
+
+    This verifies the source pathway end-to-end with the expected
+    second-order spatial and temporal convergence.
+
+    Returns (h, dt, max_abs_error, l2_error).
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    L = b - a
+    Ly = d - c
+    rho, cp, k = 1.0, 1.0, 1.0
+
+    # omega=6*pi keeps the CN temporal truncation above the spatial error floor
+    # at N=201 across dt in [0.037, 0.0185, 0.00925], so the temporal study is not
+    # contaminated by spatial error (the solution amplitude here is small).
+    omega = 6.0 * np.pi
+    kappa = np.pi / Ly
+
+    x_h, y_h = 0.5, 0.5
+    # sigma_y localizes the source; the Neumann BC is now enforced exactly by the
+    # W(y) cutoff, not by the Gaussian tail being small at the walls.
+    sigma_x = 0.10
+    sigma_y = 0.10
+
+    def Ex(X):
+        return np.exp(-((X - x_h) ** 2) / (2.0 * sigma_x ** 2))
+
+    def Ex_x(X):
+        return -((X - x_h) / sigma_x ** 2) * Ex(X)
+
+    def Ex_xx(X):
+        return ((X - x_h) ** 2 / sigma_x ** 4 - 1.0 / sigma_x ** 2) * Ex(X)
+
+    def Gy(Y):
+        return np.exp(-((Y - y_h) ** 2) / (2.0 * sigma_y ** 2))
+
+    def Gy_y(Y):
+        return -((Y - y_h) / sigma_y ** 2) * Gy(Y)
+
+    def Gy_yy(Y):
+        return ((Y - y_h) ** 2 / sigma_y ** 4 - 1.0 / sigma_y ** 2) * Gy(Y)
+
+    r_h = (y_h - c) / Ly
+    assert 0.0 < r_h < 1.0  # y_h must be strictly interior; W_norm = 0 at the walls
+    W_norm = r_h ** 2 * (1.0 - r_h) ** 2
+
+    def W(Y):
+        r = (Y - c) / Ly
+        return (r ** 2 * (1.0 - r) ** 2) / W_norm
+
+    def W_y(Y):
+        r = (Y - c) / Ly
+        return (2.0 * r * (1.0 - r) * (1.0 - 2.0 * r) / Ly) / W_norm
+
+    def W_yy(Y):
+        r = (Y - c) / Ly
+        return ((2.0 - 12.0 * r + 12.0 * r ** 2) / Ly ** 2) / W_norm
+
+    def Ey(Y):
+        return Gy(Y) * W(Y)
+
+    def Ey_y(Y):
+        return Gy_y(Y) * W(Y) + Gy(Y) * W_y(Y)
+
+    def Ey_yy(Y):
+        return Gy_yy(Y) * W(Y) + 2.0 * Gy_y(Y) * W_y(Y) + Gy(Y) * W_yy(Y)
+
+    def phi(X):
+        return (X - a) ** 2 * (b - X) ** 2
+
+    def phi_x(X):
+        return 2.0 * (X - a) * (b - X) ** 2 - 2.0 * (X - a) ** 2 * (b - X)
+
+    def phi_xx(X):
+        return 2.0 * (b - X) ** 2 - 8.0 * (X - a) * (b - X) + 2.0 * (X - a) ** 2
+
+    def psi(Y):
+        return np.cos(kappa * (Y - c))
+
+    def psi_y(Y):
+        return -kappa * np.sin(kappa * (Y - c))
+
+    def psi_yy(Y):
+        return -kappa ** 2 * np.cos(kappa * (Y - c))
+
+    def F(X, Y):
+        return Ex(X) * Ey(Y) * phi(X) * psi(Y)
+
+    def F_xx(X, Y):
+        return (Ex_xx(X) * phi(X) + 2.0 * Ex_x(X) * phi_x(X) + Ex(X) * phi_xx(X)) \
+            * Ey(Y) * psi(Y)
+
+    def F_yy(X, Y):
+        return Ex(X) * phi(X) * (
+            Ey_yy(Y) * psi(Y) + 2.0 * Ey_y(Y) * psi_y(Y) + Ey(Y) * psi_yy(Y))
+
+    def T_star(X, Y, t):
+        return 300.0 + np.sin(omega * t) * F(X, Y)
+
+    def s_star(X, Y, t):
+        g = np.sin(omega * t)
+        gp = omega * np.cos(omega * t)
+        return rho * cp * gp * F(X, Y) - k * g * (F_xx(X, Y) + F_yy(X, Y))
+
+    y_vec = np.linspace(c, d, N)
+    zero_q = np.zeros_like(y_vec)
+
+    def q_left(t):
+        return zero_q
+
+    layer = Layer2D(x_left=a, x_right=b, rho=rho, cp=cp, k=k)
+    sim = FVSolver2D(
+        a=a, b=b, c=c, d=d,
+        Nx=N, Ny=N,
+        lam_target=0.5,
+        layers=[layer],
+        t_final=0.37,
+        flux_f=1.0, flux_A=0.0,
+        dt=dt,
+        t_on=0.0, t_off=0.2, phase=0.0,
+        source=s_star,
+        q_left_fn=q_left,
+    )
+
+    T0 = T_star(sim.X, sim.Y, sim.t[0])
+    _, _, _, T_final_num = sim.solve(T0=T0, store_trajectory=False)
+    T_final_exact = T_star(sim.X, sim.Y, sim.t[-1])
+
+    error = T_final_num - T_final_exact
+    max_abs_err = float(np.max(np.abs(error)))
+    l2_err = float(np.sqrt(np.mean(error ** 2)))
+    return sim.hx, sim.dt, max_abs_err, l2_err
+
+
+def patch_source_neumann_residual(N: int = 101) -> tuple[float, float]:
+    """Max |dF/dy| of the patch-source manufactured field at the top/bottom walls.
+
+    F = Ex(x) Ey(y) phi(x) psi(y), so dF/dy = Ex phi (Ey_y psi + Ey psi_y). The
+    Neumann-compatible cutoff gives Ey(c)=Ey(d)=Ey_y(c)=Ey_y(d)=0 and
+    psi_y(c)=psi_y(d)=0, so both residuals must be zero to roundoff. Returns
+    (max|F_y(x,c)|, max|F_y(x,d)|) over the x-grid.
+    """
+    a, b, c, d = 0.0, 1.0, 0.0, 1.0
+    Ly = d - c
+    kappa = np.pi / Ly
+    x_h, y_h = 0.5, 0.5
+    sigma_x = 0.10
+    sigma_y = 0.10
+
+    X = np.linspace(a, b, N)
+
+    def Ex(x):
+        return np.exp(-((x - x_h) ** 2) / (2.0 * sigma_x ** 2))
+
+    def phi(x):
+        return (x - a) ** 2 * (b - x) ** 2
+
+    def Gy(y):
+        return np.exp(-((y - y_h) ** 2) / (2.0 * sigma_y ** 2))
+
+    def Gy_y(y):
+        return -((y - y_h) / sigma_y ** 2) * Gy(y)
+
+    r_h = (y_h - c) / Ly
+    W_norm = r_h ** 2 * (1.0 - r_h) ** 2
+
+    def W(y):
+        r = (y - c) / Ly
+        return (r ** 2 * (1.0 - r) ** 2) / W_norm
+
+    def W_y(y):
+        r = (y - c) / Ly
+        return (2.0 * r * (1.0 - r) * (1.0 - 2.0 * r) / Ly) / W_norm
+
+    def Ey(y):
+        return Gy(y) * W(y)
+
+    def Ey_y(y):
+        return Gy_y(y) * W(y) + Gy(y) * W_y(y)
+
+    def psi(y):
+        return np.cos(kappa * (y - c))
+
+    def psi_y(y):
+        return -kappa * np.sin(kappa * (y - c))
+
+    def F_y(y):
+        return Ex(X) * phi(X) * (Ey_y(y) * psi(y) + Ey(y) * psi_y(y))
+
+    return float(np.max(np.abs(F_y(c)))), float(np.max(np.abs(F_y(d))))
+
+
+# ==============================================================
+# Order-of-convergence helpers
+# ==============================================================
+
+def _pairwise_orders(hs, errs):
+    orders = []
+    for i in range(len(errs) - 1):
+        p = np.log(errs[i] / errs[i + 1]) / np.log(hs[i] / hs[i + 1])
+        orders.append(p)
+    return orders
+
+
+def space_order_test_y_independent(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_y_independent(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_y_independent(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_y_independent(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_2d(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_2d_interface(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_interface(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_interface(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_interface(N=200, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_2d_yflux(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_yflux(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_yflux(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_yflux(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_x_linear(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_x_linear(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_x_linear(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_x_linear(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def time_order_test_2d_smooth_forcing_integral(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_smooth_forcing_integral(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_2d_off_center_interface(N_list: list, x_I: float = 0.4734) -> float:
+    """Spatial convergence test with interface not on a cell-face midpoint."""
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_interface(N, dt=0.0001, x_I=x_I)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_off_center_interface(dt_list: list, x_I: float = 0.4734) -> float:
+    """Temporal convergence test with interface not on a cell-face midpoint."""
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_interface(N=200, dt=dt_val, x_I=x_I)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def run_interface_alignment_study(dt: float = 0.0001) -> dict:
+    """Compare fixed-geometry spatial refinement with and without alignment control."""
+    # These interval counts differ by multiples of 40, preserving the fractional
+    # position of each rational interface without moving the physical interface.
+    controlled_grids = (33, 73, 153)
+    studies = (
+        ("uncontrolled", 0.4734, (50, 100, 200), False),
+        ("controlled_left", 0.275, controlled_grids, True),
+        ("controlled_middle", 0.475, controlled_grids, True),
+        ("controlled_right", 0.675, controlled_grids, True),
+    )
+    cases = []
+    for name, x_I, grids, controlled in studies:
+        records = []
+        for N in grids:
+            h, dt_used, max_error, rms_error = run_mms_2d_interface(N, dt=dt, x_I=x_I)
+            records.append({
+                "N": N, "h": h, "dt": dt_used, "interface_x": x_I,
+                "interface_fraction": float((x_I / h) % 1.0),
+                "rms_error_K": rms_error, "max_error_K": max_error,
+                "error_over_h_squared": rms_error / h ** 2,
+            })
+        orders = _pairwise_orders(
+            [row["h"] for row in records],
+            [row["rms_error_K"] for row in records],
+        )
+        for row, order in zip(records, [None, *orders]):
+            row["order_from_previous"] = None if order is None else float(order)
+        cases.append({
+            "name": name, "alignment_controlled": controlled, "records": records,
+        })
+    return {
+        "t_final": 0.37,
+        "error_definition": "sqrt(mean((T_FV - T_exact)**2)) at t_final, in Kelvin",
+        "order_definition": "log(E_coarse/E_fine) / log(h_coarse/h_fine)",
+        "cases": cases,
+    }
+
+
+def near_node_interface_x_I(N: int, eps: float = 0.01) -> float:
+    """Interface eps*hx to the right of a near-center grid node, so the smaller
+    node gap is exactly eps*hx (default 1% of the cell). Recompute per N to hold
+    the near-node geometry fixed under refinement. Domain is [0, 1]."""
+    a, b = 0.0, 1.0
+    hx = (b - a) / (N - 1)
+    i0 = (N - 1) // 2          # interior node near x = 0.5
+    return a + (i0 + eps) * hx  # h_L = eps*hx (close to left node i0), h_R = (1-eps)*hx
+
+
+def space_order_test_2d_near_node_interface(N_list: list, eps: float = 0.01) -> float:
+    """Spatial convergence with the interface eps*hx from a node at every N."""
+    results, hs = [], []
+    for N in N_list:
+        x_I = near_node_interface_x_I(N, eps=eps)
+        h, _, _, l2 = run_mms_2d_interface(N, dt=0.0001, x_I=x_I)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_near_node_interface(dt_list: list, N: int = 200, eps: float = 0.01) -> float:
+    """Temporal convergence with the interface eps*hx from a node (fixed N)."""
+    x_I = near_node_interface_x_I(N, eps=eps)
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_interface(N, dt=dt_val, x_I=x_I)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+def space_order_test_2d_patch_source(N_list: list) -> float:
+    results, hs = [], []
+    for N in N_list:
+        h, _, _, l2 = run_mms_2d_patch_source(N, dt=0.0001)
+        results.append(l2)
+        hs.append(h)
+    return float(np.mean(_pairwise_orders(hs, results)))
+
+
+def time_order_test_2d_patch_source(dt_list: list) -> float:
+    results = []
+    for dt_val in dt_list:
+        _, _, _, l2 = run_mms_2d_patch_source(N=201, dt=dt_val)
+        results.append(l2)
+    return float(np.mean(_pairwise_orders(dt_list, results)))
+
+
+# ==============================================================
+# Main: print convergence tables
+# ==============================================================
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MMS verification of the 2D finite-volume solver.")
+    parser.add_argument(
+        "--interface-alignment-study", metavar="OUTPUT_DIR",
+        help="Save the off-center alignment study as CSV, JSON, PDF, and PNG.",
+    )
+    parser.add_argument("--study-dt", type=float, default=0.0001)
+    args = parser.parse_args()
+    if args.interface_alignment_study is not None:
+        import csv
+        import hashlib
+        import json
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        output = Path(args.interface_alignment_study)
+        output.mkdir(parents=True, exist_ok=True)
+        root = Path(__file__).resolve().parents[2]
+        sources = ("src/physics/mms_2d.py", "src/physics/fv_solver_2d.py",
+                   "src/physics/fv_solver_1d.py")
+        source_hashes = {
+            path: hashlib.sha256((root / path).read_bytes()).hexdigest()
+            for path in sources
+        }
+        study = run_interface_alignment_study(dt=args.study_dt)
+        study["created_utc"] = datetime.now(timezone.utc).isoformat()
+        study["source_sha256"] = source_hashes
+        (output / "interface_alignment.json").write_text(json.dumps(study, indent=2) + "\n")
+        rows = [
+            {"case": case["name"], "alignment_controlled": case["alignment_controlled"], **row}
+            for case in study["cases"] for row in case["records"]
+        ]
+        with (output / "interface_alignment.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        import matplotlib
+        matplotlib.use("Agg")
+        from visual.mms_plots import plot_interface_alignment_study
+
+        for extension in ("pdf", "png"):
+            plot_interface_alignment_study(study, output / f"interface_alignment.{extension}")
+        for case in study["cases"]:
+            orders = [row["order_from_previous"] for row in case["records"][1:]]
+            print(f"{case['name']}: pairwise orders " + ", ".join(f"{p:.4f}" for p in orders))
+        raise SystemExit(0)
+
+    print("=== y-independent MMS (2D grid) ===")
+    h, dt, me, l2 = run_mms_y_independent(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_y_independent([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_y_independent([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== Full 2D MMS ===")
+    h, dt, me, l2 = run_mms_2d(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== y-dependent Left-Flux MMS (vector q_left) ===")
+    h, dt, me, l2 = run_mms_2d_yflux(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_yflux([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_yflux([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== x-linear MMS (isolates y-Laplacian) ===")
+    h, dt, me, l2 = run_mms_x_linear(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_x_linear([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_x_linear([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== Smooth-Forcing Integral MMS (temporal only) ===")
+    h, dt, me, l2 = run_mms_2d_smooth_forcing_integral(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = time_order_test_2d_smooth_forcing_integral([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Interface MMS ===")
+    h, dt, me, l2 = run_mms_2d_interface(N=100)
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_interface([50, 100, 200])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_interface([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Off-Center Interface MMS (x_I=0.4734) ===")
+    h, dt, me, l2 = run_mms_2d_interface(N=100, dt=0.0001, x_I=0.4734)
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_off_center_interface([50, 100, 200])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_off_center_interface([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Near-Node Interface MMS (h_min/hx=0.01) ===")
+    h, dt, me, l2 = run_mms_2d_interface(N=100, dt=0.0001, x_I=near_node_interface_x_I(100))
+    print(f"N=100: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_near_node_interface([50, 100, 200])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_near_node_interface([0.0185, 0.00925, 0.004625])
+    print(f"Temporal order: {p:.3f}")
+
+    print("\n=== 2D Patch Source MMS ===")
+    h, dt, me, l2 = run_mms_2d_patch_source(N=101)
+    print(f"N=101: h={h:.5f}, dt={dt:.6f}, max_err={me:.6e}, l2_err={l2:.6e}")
+    p = space_order_test_2d_patch_source([21, 41, 81, 161])
+    print(f"Spatial order: {p:.3f}")
+    p = time_order_test_2d_patch_source([0.037, 0.0185, 0.00925])
+    print(f"Temporal order: {p:.3f}")

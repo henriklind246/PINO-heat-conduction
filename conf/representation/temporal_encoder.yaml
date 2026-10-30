@@ -1,0 +1,8 @@
+# The only representation: lean spatial channels plus a (128, 3) forcing_seq
+# token stream consumed by the temporal branch. Retained as an explicit config
+# axis so run provenance (`config_used.yaml`, published manifests) stays
+# readable. The resolved ProblemSpec owns all tensor dims (in_channels,
+# cond_static_dim, temporal_token_dim, s_y_channel, use_forcing_time_aug).
+
+benchmark:
+  representation: temporal_encoder
